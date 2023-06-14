@@ -5,9 +5,9 @@ import sqlite3
 import sys
 
 def help():
-	print('usage:src.py [-d|-i]')
-	print('\t-d\texport text')
-	print('\t-i\timport text')
+	print('usage:src.py -d|-i')
+	print('\t-d: export script')
+	print('\t-i: import script')
 
 def _init_():
     file_all = os.listdir()
