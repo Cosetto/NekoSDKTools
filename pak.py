@@ -9,7 +9,7 @@ Structure:
     uint32 data_offset XOR signed_byte_sum(name_bytes)
     uint32 stored_size XOR signed_byte_sum(name_bytes)
   repeated file data:
-    zlib stream with first 4 bytes XOR-masked
+    zlib stream plus size footer with first 0x20 bytes XOR-masked
     uint32 unpacked_size footer
 """
 
@@ -21,6 +21,7 @@ import struct
 import sys
 import tempfile
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterable
@@ -30,7 +31,8 @@ MAGIC_A = b"NEKOPACK4A"
 CHUNK_SIZE = 1024 * 1024
 UINT32_MAX = 0xFFFFFFFF
 DEFAULT_ENCODING = "cp932"
-DEFAULT_COMPRESSION_LEVEL = 6
+DEFAULT_COMPRESSION_LEVEL = 9
+DEFAULT_PACK_WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 
 class PakError(Exception):
@@ -77,7 +79,7 @@ def xor_u32(value: int, key: int) -> int:
 
 def mask_payload_header(header: bytearray, stored_size: int) -> None:
     key = stored_size // 8 + 0x22
-    for index in range(min(4, len(header))):
+    for index in range(min(0x20, len(header))):
         header[index] ^= key & 0xFF
         key = (key << 3) & UINT32_MAX
 
@@ -97,7 +99,7 @@ def parse_entries(archive_path: Path, encoding: str) -> list[Entry]:
     with archive_path.open("rb") as archive:
         header = archive.read(14)
         if len(header) < 14 or header[:10] != MAGIC_A:
-            raise PakError("unsupported archive: expected NEKOPACK4A")
+            raise PakError("Invalid NekoSDK archive!")
 
         index_size = read_u32(header, 10)
         index = archive.read(index_size)
@@ -173,8 +175,9 @@ def decrypt_zlib_stream(
 ) -> int:
     compressed_size = entry.stored_size - 4
     archive.seek(entry.offset)
-    first = bytearray(archive.read(min(4, compressed_size)))
-    if len(first) != min(4, compressed_size):
+    prefix_size = min(0x20, entry.stored_size)
+    first = bytearray(archive.read(prefix_size))
+    if len(first) != prefix_size:
         raise PakError(f"truncated data: {entry.name}")
     mask_payload_header(first, entry.stored_size)
 
@@ -188,10 +191,11 @@ def decrypt_zlib_stream(
             output.write(data)
             written += len(data)
 
-    if first:
-        feed(bytes(first))
+    compressed_prefix_size = min(prefix_size, compressed_size)
+    if compressed_prefix_size:
+        feed(bytes(first[:compressed_prefix_size]))
 
-    remaining = compressed_size - len(first)
+    remaining = compressed_size - compressed_prefix_size
     while remaining:
         chunk = archive.read(min(CHUNK_SIZE, remaining))
         if not chunk:
@@ -204,7 +208,10 @@ def decrypt_zlib_stream(
         output.write(tail)
         written += len(tail)
 
-    footer = archive.read(4)
+    footer = bytearray()
+    if prefix_size > compressed_size:
+        footer += first[compressed_size:]
+    footer += archive.read(4 - len(footer))
     if len(footer) != 4:
         raise PakError(f"missing size footer: {entry.name}")
     unpacked_size = read_u32(footer, 0)
@@ -222,7 +229,9 @@ def unpack_archive(archive_path: Path, output_dir: Path, encoding: str) -> None:
 
     entries = parse_entries(archive_path, encoding)
     with archive_path.open("rb") as archive:
-        for entry in entries:
+        total = len(entries)
+        for index, entry in enumerate(entries, 1):
+            print(f"unpacking [{index}/{total}] {entry.name}")
             out_path = safe_output_path(output_dir, entry.name)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             expected_size = None
@@ -241,7 +250,7 @@ def iter_source_names(source_dir: Path, encoding: str) -> list[str]:
     for path in source_dir.rglob("*"):
         if path.is_dir():
             continue
-        rel = path.relative_to(source_dir).as_posix()
+        rel = path.relative_to(source_dir).as_posix().replace("/", "\\")
         encoded_name(rel, encoding)
         names.append(rel)
     names.sort()
@@ -275,6 +284,31 @@ def compress_file(source: Path, destination: Path, level: int) -> tuple[int, int
     return compressed_size, unpacked_size
 
 
+def prepare_entry(
+    source_dir: Path,
+    index: int,
+    name: str,
+    encoding: str,
+    level: int,
+    temp_dir: Path,
+) -> PreparedEntry:
+    name_bytes = encoded_name(name, encoding)
+    source_path = source_path_for_name(source_dir, name)
+    temp_path = temp_dir / f"{index:08d}.z"
+    compressed_size, unpacked_size = compress_file(source_path, temp_path, level)
+    stored_size = compressed_size + 4
+    if stored_size > UINT32_MAX:
+        raise PakError(f"compressed file is too large for NEKOPACK4A: {name}")
+    return PreparedEntry(
+        name=name,
+        name_bytes=name_bytes,
+        temp_path=temp_path,
+        compressed_size=compressed_size,
+        unpacked_size=unpacked_size,
+        stored_size=stored_size,
+    )
+
+
 def build_index(entries: Iterable[PreparedEntry]) -> bytes:
     index = bytearray()
     for entry in entries:
@@ -283,6 +317,7 @@ def build_index(entries: Iterable[PreparedEntry]) -> bytes:
         index += entry.name_bytes
         index += write_u32(xor_u32(entry.offset, key))
         index += write_u32(xor_u32(entry.stored_size, key))
+    index += write_u32(0)
     if len(index) > UINT32_MAX:
         raise PakError("index is too large for NEKOPACK4A")
     return bytes(index)
@@ -291,41 +326,70 @@ def build_index(entries: Iterable[PreparedEntry]) -> bytes:
 def write_encrypted_payload(
     output: BinaryIO, temp_path: Path, stored_size: int, unpacked_size: int
 ) -> None:
+    compressed_size = stored_size - 4
+    footer = write_u32(unpacked_size)
+    prefix_size = min(0x20, stored_size)
     with temp_path.open("rb") as input_file:
-        first = bytearray(input_file.read(4))
+        compressed_prefix_size = min(prefix_size, compressed_size)
+        first = bytearray(input_file.read(compressed_prefix_size))
+        footer_prefix_size = prefix_size - compressed_prefix_size
+        if footer_prefix_size:
+            first += footer[:footer_prefix_size]
         mask_payload_header(first, stored_size)
         output.write(first)
         shutil.copyfileobj(input_file, output, CHUNK_SIZE)
-    output.write(write_u32(unpacked_size))
+    output.write(footer[footer_prefix_size:])
 
 
 def prepare_entries(
-    source_dir: Path, names: list[str], encoding: str, level: int, temp_dir: Path
+    source_dir: Path,
+    names: list[str],
+    encoding: str,
+    level: int,
+    temp_dir: Path,
+    workers: int,
 ) -> list[PreparedEntry]:
-    prepared: list[PreparedEntry] = []
-    for index, name in enumerate(names):
-        name_bytes = encoded_name(name, encoding)
-        source_path = source_path_for_name(source_dir, name)
-        temp_path = temp_dir / f"{index:08d}.z"
-        compressed_size, unpacked_size = compress_file(source_path, temp_path, level)
-        stored_size = compressed_size + 4
-        if stored_size > UINT32_MAX:
-            raise PakError(f"compressed file is too large for NEKOPACK4A: {name}")
-        prepared.append(
-            PreparedEntry(
-                name=name,
-                name_bytes=name_bytes,
-                temp_path=temp_path,
-                compressed_size=compressed_size,
-                unpacked_size=unpacked_size,
-                stored_size=stored_size,
-            )
-        )
-    return prepared
+    prepared: list[PreparedEntry | None] = [None] * len(names)
+    if workers <= 1 or len(names) == 1:
+        for index, name in enumerate(names):
+            entry = prepare_entry(source_dir, index, name, encoding, level, temp_dir)
+            prepared[index] = entry
+            print(f"packing [{index + 1}/{len(names)}] {name}")
+        return [entry for entry in prepared if entry is not None]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                prepare_entry,
+                source_dir,
+                index,
+                name,
+                encoding,
+                level,
+                temp_dir,
+            ): index
+            for index, name in enumerate(names)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            index = futures[future]
+            entry = future.result()
+            prepared[index] = entry
+            completed += 1
+            print(f"packing [{completed}/{len(names)}] {entry.name}")
+
+    missing = [names[index] for index, entry in enumerate(prepared) if entry is None]
+    if missing:
+        raise PakError(f"failed to prepare {len(missing)} file(s)")
+    return [
+        entry
+        for entry in prepared
+        if entry is not None
+    ]
 
 
 def assign_offsets(entries: list[PreparedEntry]) -> list[PreparedEntry]:
-    index_size = sum(4 + len(entry.name_bytes) + 8 for entry in entries)
+    index_size = sum(4 + len(entry.name_bytes) + 8 for entry in entries) + 4
     offset = len(MAGIC_A) + 4 + index_size
     assigned: list[PreparedEntry] = []
     for entry in entries:
@@ -353,6 +417,7 @@ def pack_archive(
     output_path: Path,
     encoding: str,
     level: int,
+    workers: int,
 ) -> None:
     if not source_dir.is_dir():
         raise PakError(f"source is not a directory: {source_dir}")
@@ -361,7 +426,7 @@ def pack_archive(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="neko_pak_") as tmp:
-        prepared = prepare_entries(source_dir, names, encoding, level, Path(tmp))
+        prepared = prepare_entries(source_dir, names, encoding, level, Path(tmp), workers)
         assigned = assign_offsets(prepared)
         index = build_index(assigned)
 
@@ -381,6 +446,32 @@ def pack_archive(
                 temp_output.unlink()
 
     print(f"packed {len(names)} file(s) to {output_path}")
+
+
+def pack_worker_count() -> int:
+    value = os.environ.get("NEKO_PAK_WORKERS")
+    if value is None:
+        return DEFAULT_PACK_WORKERS
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise PakError("NEKO_PAK_WORKERS must be a positive integer") from exc
+    if workers < 1:
+        raise PakError("NEKO_PAK_WORKERS must be a positive integer")
+    return workers
+
+
+def compression_level() -> int:
+    value = os.environ.get("NEKO_PAK_LEVEL")
+    if value is None:
+        return DEFAULT_COMPRESSION_LEVEL
+    try:
+        level = int(value)
+    except ValueError as exc:
+        raise PakError("NEKO_PAK_LEVEL must be an integer from 0 to 9") from exc
+    if not 0 <= level <= 9:
+        raise PakError("NEKO_PAK_LEVEL must be an integer from 0 to 9")
+    return level
 
 
 def usage() -> str:
@@ -406,7 +497,8 @@ def main(argv: list[str] | None = None) -> int:
                 Path(argv[1]),
                 Path(argv[2]),
                 DEFAULT_ENCODING,
-                DEFAULT_COMPRESSION_LEVEL,
+                compression_level(),
+                pack_worker_count(),
             )
     except (OSError, UnicodeError, zlib.error, PakError) as exc:
         print(f"error: {exc}", file=sys.stderr)
