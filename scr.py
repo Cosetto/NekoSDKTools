@@ -13,6 +13,7 @@ from pathlib import Path
 MAGIC = b"NEKOSDK_ADVSCRIPT2\0"
 ENCODING = "cp932"
 TEXT_OPCODE = 5
+INVALID_SCRIPT_MAGIC = "Invalid NEKOSDK_ADVSCRIPT2 script!"
 
 
 class ScriptError(Exception):
@@ -65,7 +66,7 @@ def encode_string(text: str, had_nul: bool) -> bytes:
 def read_script(path: Path) -> Script:
     data = path.read_bytes()
     if not data.startswith(MAGIC):
-        raise ScriptError(f"not a NEKOSDK_ADVSCRIPT2 file: {path}")
+        raise ScriptError(INVALID_SCRIPT_MAGIC)
 
     pos = len(MAGIC)
     if pos + 4 > len(data):
@@ -294,15 +295,16 @@ def import_file(original_path: Path, json_path: Path, output_path: Path) -> None
     print(f"imported {changed} change(s): {original_path} + {json_path} -> {output_path}")
 
 
+def is_invalid_magic_error(exc: ScriptError) -> bool:
+    return str(exc) == INVALID_SCRIPT_MAGIC
+
+
+def report_skip(path: Path, exc: ScriptError) -> None:
+    print(f"error: {exc} Skipping: {path}", file=sys.stderr)
+
+
 def iter_script_files(root: Path) -> list[Path]:
-    files = []
-    for path in root.rglob("*"):
-        if path.is_file():
-            try:
-                if path.read_bytes()[: len(MAGIC)] == MAGIC:
-                    files.append(path)
-            except OSError:
-                pass
+    files = [path for path in root.rglob("*") if path.is_file()]
     files.sort()
     return files
 
@@ -312,10 +314,20 @@ def export_path(input_path: Path, output_path: Path) -> None:
         output_path.mkdir(parents=True, exist_ok=True)
         files = iter_script_files(input_path)
         if not files:
-            raise ScriptError(f"no ADVSCRIPT2 files found: {input_path}")
+            raise ScriptError(f"no files found: {input_path}")
+        processed = 0
         for file_path in files:
             rel = file_path.relative_to(input_path)
-            export_file(file_path, (output_path / rel).with_suffix(".json"))
+            try:
+                export_file(file_path, (output_path / rel).with_suffix(".json"))
+                processed += 1
+            except ScriptError as exc:
+                if is_invalid_magic_error(exc):
+                    report_skip(file_path, exc)
+                    continue
+                raise
+        if processed == 0:
+            raise ScriptError(f"no valid ADVSCRIPT2 files found: {input_path}")
     else:
         export_file(input_path, output_path)
 
@@ -327,13 +339,30 @@ def import_path(original_path: Path, json_path: Path, output_path: Path) -> None
         output_path.mkdir(parents=True, exist_ok=True)
         files = iter_script_files(original_path)
         if not files:
-            raise ScriptError(f"no ADVSCRIPT2 files found: {original_path}")
+            raise ScriptError(f"no files found: {original_path}")
+        processed = 0
         for file_path in files:
             rel = file_path.relative_to(original_path)
             src_json = (json_path / rel).with_suffix(".json")
+            try:
+                read_script(file_path)
+            except ScriptError as exc:
+                if is_invalid_magic_error(exc):
+                    report_skip(file_path, exc)
+                    continue
+                raise
             if not src_json.exists():
                 raise ScriptError(f"missing JSON file: {src_json}")
-            import_file(file_path, src_json, output_path / rel)
+            try:
+                import_file(file_path, src_json, output_path / rel)
+                processed += 1
+            except ScriptError as exc:
+                if is_invalid_magic_error(exc):
+                    report_skip(file_path, exc)
+                    continue
+                raise
+        if processed == 0:
+            raise ScriptError(f"no valid ADVSCRIPT2 files found: {original_path}")
     else:
         import_file(original_path, json_path, output_path)
 
