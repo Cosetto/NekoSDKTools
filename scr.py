@@ -13,6 +13,7 @@ from pathlib import Path
 MAGIC = b"NEKOSDK_ADVSCRIPT2\0"
 ENCODING = "cp932"
 TEXT_OPCODE = 5
+SCENE_OPCODE = 1
 INVALID_SCRIPT_MAGIC = "Invalid NEKOSDK_ADVSCRIPT2 script!"
 
 
@@ -154,13 +155,86 @@ def is_text_record(record: Record) -> bool:
     return record.header[3] == TEXT_OPCODE and len(record.args) >= 2 and bool(record.args[1])
 
 
+def is_scene_record(record: Record) -> bool:
+    return record.header[3] == SCENE_OPCODE and (
+        bool(record.main) or (len(record.args) > 31 and bool(record.args[31]))
+    )
+
+
+def scene_source_text(record: Record) -> str:
+    if len(record.args) > 31 and record.args[31]:
+        return record.args[31]
+    return record.main.rstrip("\r\n")
+
+
+def split_line_ending(line: str) -> tuple[str, str]:
+    if line.endswith("\r\n"):
+        return line[:-2], "\r\n"
+    if line.endswith("\n") or line.endswith("\r"):
+        return line[:-1], line[-1]
+    return line, ""
+
+
+def is_scene_choice_header(line: str) -> bool:
+    body, _ = split_line_ending(line)
+    return body.lstrip(";:") == "選択肢"
+
+
+def parse_scene_choice_lines(text: str) -> list[tuple[int, str, str, str]] | None:
+    lines = text.splitlines(True)
+    if not lines or not is_scene_choice_header(lines[0]):
+        return None
+
+    choices: list[tuple[int, str, str, str]] = []
+    for line_index, line in enumerate(lines[1:], 1):
+        body, ending = split_line_ending(line)
+        if not body:
+            continue
+        prefix = body[0] if body[0] in ";:" else ""
+        choice = body[1:] if prefix else body
+        if choice:
+            choices.append((line_index, prefix, choice, ending))
+    return choices if choices else None
+
+
+def scene_choice_lines(record: Record) -> list[tuple[int, str, str, str]] | None:
+    if not is_scene_record(record):
+        return None
+    return parse_scene_choice_lines(scene_source_text(record))
+
+
+def is_scene_choice_record(record: Record) -> bool:
+    return scene_choice_lines(record) is not None
+
+
+def replace_scene_choice_text(text: str, choices: list[str]) -> str:
+    lines = text.splitlines(True)
+    parsed = parse_scene_choice_lines(text)
+    if parsed is None:
+        raise ScriptError("internal error: not a scene choice block")
+    if len(parsed) != len(choices):
+        raise ScriptError("internal error: scene choice count changed")
+
+    for choice, (line_index, prefix, _, ending) in zip(choices, parsed):
+        lines[line_index] = f"{prefix}{choice}{ending}"
+    return "".join(lines)
+
+
+def set_scene_choices(record: Record, choices: list[str]) -> None:
+    record.main = replace_scene_choice_text(record.main, choices)
+    record.main_had_nul = True
+    if len(record.args) > 31 and record.args[31]:
+        record.args[31] = replace_scene_choice_text(record.args[31], choices)
+        record.args_had_nul[31] = True
+
+
 def is_choice_record(record: Record) -> bool:
-    if record.header[3] == TEXT_OPCODE:
+    if record.header[3] in (TEXT_OPCODE, SCENE_OPCODE):
         return False
     if record.main.startswith("選択肢\r") or record.main.startswith("選択肢\n"):
         return True
     haystack = record.main + "\n" + "\n".join(record.args)
-    markers = ("[選択", "選択肢", "[セレクト", "choice", "Choice", "select", "Select")
+    markers = ("[選択", "選択肢", "[セレクト")
     return any(marker in haystack for marker in markers)
 
 
@@ -219,6 +293,11 @@ def export_items(script: Script) -> list[dict[str, str]]:
                 items.append({"name": name, "message": message})
             else:
                 items.append({"message": message})
+        elif is_scene_choice_record(record):
+            choices = scene_choice_lines(record)
+            if choices is not None:
+                for _, _, choice, _ in choices:
+                    items.append({"choice": choice})
         elif is_choice_record(record):
             for _, _, choice in extract_choice_texts(record):
                 items.append({"choice": choice})
@@ -249,6 +328,28 @@ def import_items(script: Script, items: list[dict[str, str]], source_name: str) 
                 record.main = make_text_main(name, message, record.main)
                 record.main_had_nul = True
             index += 1
+        elif is_scene_choice_record(record):
+            choices = scene_choice_lines(record)
+            if choices is None:
+                continue
+            if index >= len(items) or "choice" not in items[index]:
+                continue
+            new_choices = []
+            scene_changed = False
+            for _, _, old_choice, _ in choices:
+                if index >= len(items):
+                    raise ScriptError(f"not enough JSON entries for {source_name}")
+                item = items[index]
+                if "choice" not in item:
+                    raise ScriptError(f"entry {index} should contain choice in {source_name}")
+                choice = str(item["choice"])
+                if old_choice != choice:
+                    scene_changed = True
+                new_choices.append(choice)
+                index += 1
+            if scene_changed:
+                changed += 1
+                set_scene_choices(record, new_choices)
         elif is_choice_record(record):
             for target, arg_index, _ in extract_choice_texts(record):
                 if index >= len(items):
@@ -268,7 +369,6 @@ def import_items(script: Script, items: list[dict[str, str]], source_name: str) 
                     record.args[arg_index] = choice
                     record.args_had_nul[arg_index] = True
                 index += 1
-
     if index != len(items):
         raise ScriptError(f"{len(items) - index} unused JSON entries for {source_name}")
     return changed
